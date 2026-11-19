@@ -23,9 +23,65 @@ to metadata::
 The empty key ``()`` is the all-defaults fallback variant.
 """
 
+import hashlib
+import json
+from collections.abc import Mapping
+from itertools import product
+
+__all__ = [
+    "ShaderError",
+    "normalize_key",
+    "enumerate_variants",
+    "cache_key",
+    "classify_failure",
+    "fallback_chain",
+    "dedupe_variants",
+    "select_batch",
+    "apply_hot_reload",
+]
+
+_TRUTHY_STRINGS = frozenset({"1", "true", "on", "yes"})
+_FALSY_STRINGS = frozenset({"0", "false", "off", "no"})
+
+_SYNTAX_MARKERS = ("syntax", "parse error", "unexpected token", "expected")
+_LINK_MARKERS = ("link", "undefined reference", "unresolved external", "duplicate symbol")
+_UNSUPPORTED_MARKERS = (
+    "unsupported",
+    "not supported",
+    "requires feature",
+    "extension unavailable",
+)
+
 
 class ShaderError(Exception):
     """Raised for invalid shader-variant input or an impossible request."""
+
+
+def _canonical_value(value):
+    """Canonicalize one feature value (booleans, strings, lists)."""
+    # bool is a subclass of int, so it must be checked before plain scalars.
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in _TRUTHY_STRINGS:
+            return 1
+        if lowered in _FALSY_STRINGS:
+            return 0
+        return value
+    if isinstance(value, list):
+        items = [_canonical_value(item) for item in value]
+        try:
+            unique = list(frozenset(items))
+        except TypeError as exc:
+            raise ShaderError("a list feature contains an unhashable item") from exc
+        try:
+            unique.sort()
+        except TypeError as exc:
+            raise ShaderError("a list feature contains items that cannot be ordered") from exc
+        return tuple(unique)
+    # Tuples are already canonical and are preserved; other scalars pass through.
+    return value
 
 
 def normalize_key(key: dict) -> tuple:
@@ -56,7 +112,20 @@ def normalize_key(key: dict) -> tuple:
         ShaderError: if ``key`` is not a mapping, a feature name is not a
             string, or a value cannot be made hashable.
     """
-    raise NotImplementedError
+    if not isinstance(key, Mapping):
+        raise ShaderError("variant key must be a mapping of feature names")
+    pairs = []
+    for name, value in key.items():
+        if not isinstance(name, str):
+            raise ShaderError("feature names must be strings")
+        pairs.append((name.lower(), _canonical_value(value)))
+    try:
+        pairs.sort()
+        result = tuple(pairs)
+        hash(result)
+    except TypeError as exc:
+        raise ShaderError("variant key contains a value that cannot be made hashable") from exc
+    return result
 
 
 def enumerate_variants(keys: list[dict], max_variants: int) -> list[tuple]:
@@ -94,7 +163,38 @@ def enumerate_variants(keys: list[dict], max_variants: int) -> list[tuple]:
             the Cartesian product would contain more than ``max_variants``
             variants.  The size guard runs before generating the full product.
     """
-    raise NotImplementedError
+    if not isinstance(keys, list):
+        raise ShaderError("keys must be a list of feature dictionaries")
+    if not isinstance(max_variants, int) or max_variants < 0:
+        raise ShaderError("max_variants must be a non-negative integer")
+
+    axes = []  # (feature name, tuple of alternatives), in expansion order
+    for feature_dict in keys:
+        if not isinstance(feature_dict, Mapping):
+            raise ShaderError("each entry of keys must be a feature dictionary")
+        for name, value in normalize_key(feature_dict):
+            alternatives = value if isinstance(value, tuple) else (value,)
+            axes.append((name, alternatives))
+
+    # Size guard first: never materialize an oversized Cartesian product.
+    total = 1
+    for _, alternatives in axes:
+        total *= len(alternatives)
+    if total > max_variants:
+        raise ShaderError(
+            f"variant expansion would yield {total} variants, "
+            f"exceeding the cap of {max_variants}"
+        )
+
+    if not axes:
+        return [()]
+
+    names = [name for name, _ in axes]
+    variants = []
+    for combination in product(*(alternatives for _, alternatives in axes)):
+        # Re-sort the pairs so every emitted variant is a normalized key.
+        variants.append(tuple(sorted(zip(names, combination))))
+    return variants
 
 
 def cache_key(base_source: str, key: tuple, pipeline: dict) -> str:
@@ -127,7 +227,23 @@ def cache_key(base_source: str, key: tuple, pipeline: dict) -> str:
         ShaderError: if ``pipeline`` is not a mapping or contains a value that
             cannot be serialized deterministically to JSON.
     """
-    raise NotImplementedError
+    if not isinstance(base_source, str):
+        raise ShaderError("base_source must be a string")
+    if not isinstance(pipeline, Mapping):
+        raise ShaderError("pipeline must be a mapping")
+
+    source_hash = hashlib.sha256(base_source.encode("utf-8")).hexdigest()
+    try:
+        # sort_keys recurses into every nested mapping, so dict insertion
+        # order anywhere in the pipeline cannot change the digest.
+        payload = json.dumps(
+            [source_hash, key, pipeline],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ShaderError("pipeline cannot be serialized deterministically to JSON") from exc
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def classify_failure(error: str) -> str:
@@ -136,7 +252,7 @@ def classify_failure(error: str) -> str:
     Matching is case-insensitive.  Buckets are checked in this order:
 
     * ``"syntax"``: ``syntax``, ``parse error``, ``unexpected token``,
-      ``expected``;
+      ``"expected"``;
     * ``"link"``: ``link``, ``undefined reference``, ``unresolved external``,
       ``duplicate symbol``;
     * ``"unsupported"``: ``unsupported``, ``not supported``,
@@ -157,7 +273,17 @@ def classify_failure(error: str) -> str:
     Raises:
         ShaderError: if ``error`` is not a string.
     """
-    raise NotImplementedError
+    if not isinstance(error, str):
+        raise ShaderError("failure diagnostic must be a string")
+    text = error.lower()
+    for markers, bucket in (
+        (_SYNTAX_MARKERS, "syntax"),
+        (_LINK_MARKERS, "link"),
+        (_UNSUPPORTED_MARKERS, "unsupported"),
+    ):
+        if any(marker in text for marker in markers):
+            return bucket
+    return "driver"
 
 
 def fallback_chain(key: tuple, supported: set) -> list[tuple]:
@@ -187,7 +313,38 @@ def fallback_chain(key: tuple, supported: set) -> list[tuple]:
         ShaderError: ``key`` is not a hashable normalized tuple, or ``()`` is
             not in ``supported`` (there is then no safe fallback to return).
     """
-    raise NotImplementedError
+    if not isinstance(key, tuple):
+        raise ShaderError("variant key must be a normalized tuple")
+    try:
+        hash(key)
+    except TypeError as exc:
+        raise ShaderError("variant key must be hashable") from exc
+    try:
+        if () not in supported:
+            raise ShaderError("the empty fallback variant () must be supported")
+    except TypeError as exc:
+        raise ShaderError("supported must be a set of variant key tuples") from exc
+
+    chain = [key]
+    # Drop the trailing (least important) feature one at a time.
+    for cut in range(len(key) - 1, -1, -1):
+        candidate = key[:cut]
+        if candidate in supported:
+            chain.append(candidate)
+    return chain
+
+
+def _variant_identity(variant: dict) -> tuple:
+    """Return the content identity ``(normalized key, source_hash)``."""
+    if not isinstance(variant, Mapping):
+        raise ShaderError("each variant must be a dictionary")
+    if "key" not in variant or "source_hash" not in variant:
+        raise ShaderError("variant requires both 'key' and 'source_hash' fields")
+    try:
+        normalized = normalize_key(dict(variant["key"]))
+    except (TypeError, ShaderError) as exc:
+        raise ShaderError("variant 'key' must be a normalized key tuple") from exc
+    return normalized, variant["source_hash"]
 
 
 def dedupe_variants(variants: list[dict]) -> list[dict]:
@@ -210,7 +367,20 @@ def dedupe_variants(variants: list[dict]) -> list[dict]:
         ShaderError: a variant is not a mapping or lacks the required ``key``
             and ``source_hash`` fields.
     """
-    raise NotImplementedError
+    if not isinstance(variants, list):
+        raise ShaderError("variants must be a list of variant dictionaries")
+    seen = set()
+    result = []
+    for variant in variants:
+        identity = _variant_identity(variant)
+        try:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        except TypeError as exc:
+            raise ShaderError("variant identity is not hashable") from exc
+        result.append(variant)
+    return result
 
 
 def select_batch(requests: list[dict], compiled: dict, budget: int) -> dict:
@@ -243,7 +413,31 @@ def select_batch(requests: list[dict], compiled: dict, budget: int) -> dict:
         ShaderError: ``budget`` is negative, a request is malformed, or a cost
             is not a positive integer.
     """
-    raise NotImplementedError
+    if not isinstance(requests, list):
+        raise ShaderError("requests must be a list of request dictionaries")
+    if not isinstance(compiled, Mapping):
+        raise ShaderError("compiled must be a mapping of cached artifacts")
+    if not isinstance(budget, int) or budget < 0:
+        raise ShaderError("budget must be a non-negative integer")
+
+    batch = {"compile": [], "cached": [], "skipped": [], "used": 0}
+    remaining = budget
+    for request in requests:
+        identity = _variant_identity(request)
+        cost = request.get("cost", 1)
+        if not isinstance(cost, int) or cost <= 0:
+            raise ShaderError("variant cost must be a positive integer")
+
+        if compiled.get(identity):
+            batch["cached"].append(request)
+        elif cost <= remaining:
+            batch["compile"].append(request)
+            remaining -= cost
+            batch["used"] += cost
+        else:
+            # Never substitute another variant: report the request as skipped.
+            batch["skipped"].append(request)
+    return batch
 
 
 def apply_hot_reload(base_source: str, changed_files: list[str], cache: dict) -> dict:
@@ -285,4 +479,39 @@ def apply_hot_reload(base_source: str, changed_files: list[str], cache: dict) ->
         ShaderError: an entry is missing required metadata or has a malformed
             dependency list.
     """
-    raise NotImplementedError
+    if not isinstance(base_source, str):
+        raise ShaderError("base_source must be a string")
+    if not isinstance(changed_files, list):
+        raise ShaderError("changed_files must be a list of file names")
+    changed = set()
+    for path in changed_files:
+        if not isinstance(path, str):
+            raise ShaderError("changed file names must be strings")
+        changed.add(path)
+    if not isinstance(cache, Mapping):
+        raise ShaderError("cache must be a mapping of cache entries")
+
+    current_hash = hashlib.sha256(base_source.encode("utf-8")).hexdigest()
+    invalidated = []
+    kept = 0
+    for cache_entry_key, entry in cache.items():
+        if not isinstance(entry, Mapping):
+            raise ShaderError("each cache entry must be a metadata mapping")
+        for field in ("key", "source_hash", "dependencies"):
+            if field not in entry:
+                raise ShaderError(f"cache entry is missing required field {field!r}")
+        dependencies = entry["dependencies"]
+        if isinstance(dependencies, str) or not isinstance(dependencies, (list, tuple)):
+            raise ShaderError("cache entry 'dependencies' must be a list or tuple of names")
+        for dependency in dependencies:
+            if not isinstance(dependency, str):
+                raise ShaderError("dependency file names must be strings")
+
+        source_changed = entry["source_hash"] != current_hash
+        dependency_changed = any(dependency in changed for dependency in dependencies)
+        if source_changed or dependency_changed:
+            invalidated.append(cache_entry_key)
+        else:
+            kept += 1
+
+    return {"invalidated": invalidated, "kept": kept}
